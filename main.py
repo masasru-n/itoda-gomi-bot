@@ -3,6 +3,9 @@ import hmac
 import hashlib
 import base64
 import logging
+import json
+import uuid
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
@@ -12,6 +15,8 @@ from anthropic import Anthropic
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+JST = timezone(timedelta(hours=9))
 
 # 環境変数
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
@@ -63,24 +68,60 @@ def get_claude_response(user_message: str) -> str:
         return (
             "申し訳ありません、現在お答えできません。\n"
             "しばらく時間をおいて再度お試しください。\n"
-            "📞 税務町民課 環境衛生係 0947-26-1235"
+            "📞 糸田清掃 0947-26-0917（平日 8:00〜17:00）"
         )
 
 
-async def reply_to_line(reply_token: str, text: str) -> None:
-    """LINE Messaging APIに返信"""
+async def reply_to_line(reply_token: str, text: str, answer_id: str | None = None) -> None:
+    """LINE Messaging APIに返信。answer_idがあるとき👍/👎のQuick Replyを付与"""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
     }
+    message = {"type": "text", "text": text}
+
+    if answer_id:
+        message["quickReply"] = {
+            "items": [
+                {
+                    "type": "action",
+                    "action": {
+                        "type": "postback",
+                        "label": "👍 役立った",
+                        "data": f"action=feedback&rating=good&answer_id={answer_id}",
+                        "displayText": "👍 役立った",
+                    },
+                },
+                {
+                    "type": "action",
+                    "action": {
+                        "type": "postback",
+                        "label": "👎 役立たなかった",
+                        "data": f"action=feedback&rating=bad&answer_id={answer_id}",
+                        "displayText": "👎 役立たなかった",
+                    },
+                },
+            ]
+        }
+
     payload = {
         "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text}],
+        "messages": [message],
     }
     async with httpx.AsyncClient(timeout=10.0) as http_client:
         resp = await http_client.post(LINE_REPLY_URL, headers=headers, json=payload)
         if resp.status_code != 200:
             logger.error(f"LINE reply failed: {resp.status_code} {resp.text}")
+
+
+def parse_postback(data: str) -> dict:
+    """'action=feedback&rating=good&answer_id=xxx' 形式を辞書に変換"""
+    result = {}
+    for pair in data.split("&"):
+        if "=" in pair:
+            key, value = pair.split("=", 1)
+            result[key] = value
+    return result
 
 
 @app.get("/")
@@ -107,21 +148,44 @@ async def webhook(request: Request):
     events = data.get("events", [])
 
     for event in events:
-        # テキストメッセージのみ処理
-        if event.get("type") != "message":
-            continue
-        message = event.get("message", {})
-        if message.get("type") != "text":
-            continue
-
-        user_text = message.get("text", "")
+        event_type = event.get("type")
         reply_token = event.get("replyToken", "")
         user_id = event.get("source", {}).get("userId", "unknown")
 
-        logger.info(f"Q from {user_id}: {user_text}")
-        answer = get_claude_response(user_text)
-        logger.info(f"A: {answer}")
+        # === テキストメッセージ ===
+        if event_type == "message":
+            message = event.get("message", {})
+            if message.get("type") != "text":
+                continue
 
-        await reply_to_line(reply_token, answer)
+            user_text = message.get("text", "")
+            answer = get_claude_response(user_text)
+            answer_id = str(uuid.uuid4())
+
+            # QAログ（1行JSON）— Railwayログから抽出して日次集計
+            logger.info(json.dumps({
+                "type": "qa_log",
+                "timestamp": datetime.now(JST).isoformat(),
+                "answer_id": answer_id,
+                "user_id": user_id,
+                "question": user_text,
+                "answer": answer,
+            }, ensure_ascii=False))
+
+            await reply_to_line(reply_token, answer, answer_id=answer_id)
+
+        # === Quick Replyの評価（postback） ===
+        elif event_type == "postback":
+            pb = parse_postback(event.get("postback", {}).get("data", ""))
+            if pb.get("action") == "feedback":
+                # フィードバックログ（1行JSON）— answer_idでQAと突合
+                logger.info(json.dumps({
+                    "type": "feedback",
+                    "timestamp": datetime.now(JST).isoformat(),
+                    "answer_id": pb.get("answer_id", ""),
+                    "user_id": user_id,
+                    "rating": pb.get("rating", ""),
+                }, ensure_ascii=False))
+                await reply_to_line(reply_token, "ご評価ありがとうございます。")
 
     return PlainTextResponse("OK")
