@@ -181,6 +181,20 @@ def session_expired(sess: dict, now: datetime) -> bool:
     return (now - sess["updated_at"]).total_seconds() > SESSION_TIMEOUT_SEC
 
 
+# ───────────────────────────────────────────────
+# リッチメニュー左タップ（postback: action=usage_guide）で返す使い方ガイド
+# ───────────────────────────────────────────────
+USAGE_GUIDE = (
+    "こんにちは。sil（シル）です。\n"
+    "私は糸田町のごみ分別についてのご質問にお答えするAIアシスタントです。\n\n"
+    "例えば以下のように質問いただければ私が回答いたします。\n"
+    "・「○○は何で出すの？」\n"
+    "・「うちの地区の収集日を教えて」\n"
+    "・「粗大ごみはどうやって出す？」\n"
+    "・「ペットボトルのキャップはどこに入れるの？」\n\n"
+    "お気軽にご質問ください。"
+)
+
 CLEANUP_GUIDE = (
     "ご自宅からのごみ運び出し・片付けは、糸田清掃が承っております。\n"
     "【対応内容】\n"
@@ -405,6 +419,16 @@ async def webhook(request: Request):
         elif event_type == "postback":
             pb = parse_postback(event.get("postback", {}).get("data", ""))
             action = pb.get("action", "")
+
+            # ── リッチメニュー：左タップ（使い方ガイド）──
+            if action == "usage_guide":
+                await reply_to_line(reply_token, USAGE_GUIDE)
+                continue
+
+            # ── リッチメニュー：中央タップ（片付けサービス案内）──
+            if action == "cleanup_menu":
+                await reply_to_line(reply_token, CLEANUP_GUIDE, cleanup_entry_items())
+                continue
 
             if action == "feedback":
                 rating = pb.get("rating", "")
