@@ -18,23 +18,18 @@ logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
 
-# 環境変数
 LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-# 日次レポート・bad即時通知の宛先（カンマ区切りで複数可）
 ADMIN_USER_IDS = [
     uid.strip() for uid in os.environ.get("ADMIN_USER_IDS", "").split(",") if uid.strip()
 ]
-# 片付け受付通知の宛先（事務員。カンマ区切りで複数可）
 STAFF_USER_IDS = [
     uid.strip() for uid in os.environ.get("STAFF_USER_IDS", "").split(",") if uid.strip()
 ]
-# /daily-report の簡易保護キー（未設定なら保護なし）
 REPORT_KEY = os.environ.get("REPORT_KEY", "")
 
-# ナレッジベース・システムプロンプトをファイルから読込
 BASE_DIR = Path(__file__).parent
 KNOWLEDGE = (BASE_DIR / "itoda_gomi_knowledge_v2.md").read_text(encoding="utf-8")
 SYSTEM_PROMPT_BASE = (BASE_DIR / "system_prompt_v3.txt").read_text(encoding="utf-8")
@@ -52,23 +47,18 @@ anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
-# === インメモリ集計用ストア（当日分のみ。再起動でリセット） ===
 qa_records: list[dict] = []
 feedback_records: list[dict] = []
 
-# === 受付フローのセッション（user_idごとの状態。再起動でリセット） ===
-# sessions[user_id] = {"step", "contact", "type", "scale", "updated_at"}
 sessions: dict[str, dict] = {}
-SESSION_TIMEOUT_SEC = 600  # 10分
+SESSION_TIMEOUT_SEC = 600
 
-# 片付け受付の起点キーワード
 CLEANUP_KEYWORDS = [
     "片付け", "片づけ", "かたづけ", "処分", "運び出し", "運べない", "運んで",
     "ゴミ屋敷", "ごみ屋敷", "遺品整理", "生前整理", "引っ越し", "引越し",
     "大量", "重い", "一人で", "高齢",
 ]
 
-# 選択肢のコード→ラベル変換
 TYPE_LABELS = {"t1": "粗大ごみ（家具など）", "t2": "雑多なごみ", "t3": "その他"}
 SCALE_LABELS = {"s1": "家具数点", "s2": "1部屋分", "s3": "一軒丸ごと", "s4": "その他"}
 TIMING_LABELS = {"d1": "できるだけ早く", "d2": "1週間以内", "d3": "1ヶ月以内", "d4": "その他"}
@@ -83,8 +73,7 @@ def today_str() -> str:
 
 
 def is_business_hours(dt: datetime) -> bool:
-    """平日 8:00〜17:00 を営業時間とする"""
-    if dt.weekday() >= 5:  # 土日
+    if dt.weekday() >= 5:
         return False
     return 8 <= dt.hour < 17
 
@@ -121,7 +110,6 @@ def get_claude_response(user_message: str) -> str:
         )
 
 
-# === Quick Reply アイテム生成 ===
 def feedback_items(answer_id: str) -> list[dict]:
     return [
         {"type": "action", "action": {"type": "postback", "label": "👍 役立った",
@@ -131,10 +119,12 @@ def feedback_items(answer_id: str) -> list[dict]:
     ]
 
 
-def intake_start_items() -> list[dict]:
+def cleanup_entry_items() -> list[dict]:
     return [
-        {"type": "action", "action": {"type": "postback", "label": "依頼を受け付ける",
-            "data": "action=intake_start", "displayText": "依頼を受け付ける"}},
+        {"type": "action", "action": {"type": "uri",
+            "label": "電話", "uri": "tel:0947260917"}},
+        {"type": "action", "action": {"type": "postback",
+            "label": "LINE", "data": "action=intake_start", "displayText": "LINEで受付"}},
     ]
 
 
@@ -191,12 +181,19 @@ def session_expired(sess: dict, now: datetime) -> bool:
     return (now - sess["updated_at"]).total_seconds() > SESSION_TIMEOUT_SEC
 
 
-# === 固定メッセージ ===
 CLEANUP_GUIDE = (
-    "ごみの運び出しやお片付けは、糸田清掃で承っております。\n"
-    "家具の処分、お部屋の片付け、一軒まるごとの整理まで対応しています。\n\n"
-    "このままLINEで依頼の受付ができます。\n"
-    "下のボタンからお進みください。"
+    "ご自宅からのごみ運び出し・片付けは、糸田清掃が承っております。\n"
+    "【対応内容】\n"
+    "・ご自宅への訪問集荷\n"
+    "・家具・大型品の搬出\n"
+    "・焼却場への運搬\n"
+    "・生前整理・遺品整理・引越しごみ\n"
+    "・高齢等でごみ出しが困難な方の支援\n\n"
+    "お見積りは無料です。\n"
+    "お電話でのご相談が可能です（平日 8:00〜17:00）\n"
+    "📞 0947-26-0917\n\n"
+    "LINEでも受け付けております。\n"
+    "下のボタンからお選びください。"
 )
 ASK_CONTACT = (
     "ご依頼を受け付けます。\n"
@@ -286,35 +283,28 @@ def build_bad_alert(answer_id: str, when: datetime) -> str:
 def build_daily_report() -> str:
     prune_old_records()
     today = today_str()
-
     total_q = len(qa_records)
     unique_users = {r["user_id"] for r in qa_records}
     user_counts: dict[str, int] = {}
     for r in qa_records:
         user_counts[r["user_id"]] = user_counts.get(r["user_id"], 0) + 1
     repeat_users = sum(1 for c in user_counts.values() if c >= 2)
-
     good = sum(1 for f in feedback_records if f["rating"] == "good")
     bad = sum(1 for f in feedback_records if f["rating"] == "bad")
     rated = good + bad
     rate_pct = round(rated / total_q * 100, 1) if total_q else 0.0
     bad_pct = round(bad / total_q * 100, 1) if total_q else 0.0
-
     bad_answer_ids = {f["answer_id"] for f in feedback_records if f["rating"] == "bad"}
     qa_by_id = {r["answer_id"]: r for r in qa_records}
     bad_questions = [qa_by_id[aid]["question"] for aid in bad_answer_ids if aid in qa_by_id]
-
     rated_answer_ids = {f["answer_id"] for f in feedback_records}
     no_rating = sum(1 for r in qa_records if r["answer_id"] not in rated_answer_ids)
-
     lines = [
-        f"【糸田ゴミBot 日次レポート {today}】",
-        "",
+        f"【糸田ゴミBot 日次レポート {today}】", "",
         "■ 利用状況",
         f"・質問数: {total_q}件",
         f"・ユニークユーザー: {len(unique_users)}人",
-        f"・リピートユーザー: {repeat_users}人",
-        "",
+        f"・リピートユーザー: {repeat_users}人", "",
         "■ フィードバック",
         f"・👍 good: {good}件",
         f"・👎 bad: {bad}件",
@@ -369,22 +359,18 @@ async def webhook(request: Request):
         user_id = event.get("source", {}).get("userId", "unknown")
         now = now_jst()
 
-        # ============ テキストメッセージ ============
         if event_type == "message":
             message = event.get("message", {})
             if message.get("type") != "text":
                 continue
             user_text = message.get("text", "")
-
             sess = sessions.get(user_id)
 
-            # 受付セッションのタイムアウト判定
             if sess and session_expired(sess, now):
                 sessions.pop(user_id, None)
                 await reply_to_line(reply_token, TIMEOUT_MSG)
                 continue
 
-            # 受付フロー中の処理
             if sess:
                 if user_text.strip() in ("キャンセル", "中止", "やめる"):
                     sessions.pop(user_id, None)
@@ -396,16 +382,13 @@ async def webhook(request: Request):
                     sess["updated_at"] = now
                     await reply_to_line(reply_token, ASK_TYPE, choice_items("intake_type", TYPE_LABELS))
                     continue
-                # 選択待ちの段階でテキストが来た場合は促す
                 await reply_to_line(reply_token, DURING_INTAKE)
                 continue
 
-            # IDLE: 片付けキーワード検知 → 固定案内＋受付ボタン
             if contains_cleanup_keyword(user_text):
-                await reply_to_line(reply_token, CLEANUP_GUIDE, intake_start_items())
+                await reply_to_line(reply_token, CLEANUP_GUIDE, cleanup_entry_items())
                 continue
 
-            # 通常のごみ分別応答（good/bad付き）
             answer = get_claude_response(user_text)
             answer_id = str(uuid.uuid4())
             logger.info(json.dumps({
@@ -419,12 +402,10 @@ async def webhook(request: Request):
             })
             await reply_to_line(reply_token, answer, feedback_items(answer_id))
 
-        # ============ postback ============
         elif event_type == "postback":
             pb = parse_postback(event.get("postback", {}).get("data", ""))
             action = pb.get("action", "")
 
-            # --- good/bad 評価 ---
             if action == "feedback":
                 rating = pb.get("rating", "")
                 ans_id = pb.get("answer_id", "")
@@ -441,7 +422,6 @@ async def webhook(request: Request):
                     await push_to_line(ADMIN_USER_IDS, build_bad_alert(ans_id, now))
                 await reply_to_line(reply_token, "ご評価ありがとうございます。")
 
-            # --- 受付開始 ---
             elif action == "intake_start":
                 sessions[user_id] = {
                     "step": "await_contact", "contact": None,
@@ -449,29 +429,24 @@ async def webhook(request: Request):
                 }
                 await reply_to_line(reply_token, ASK_CONTACT)
 
-            # --- 受付の選択ステップ ---
             elif action in ("intake_type", "intake_scale", "intake_timing"):
                 sess = sessions.get(user_id)
                 if not sess or session_expired(sess, now):
                     sessions.pop(user_id, None)
                     await reply_to_line(reply_token, EXPIRED_MSG)
                     continue
-
                 if action == "intake_type" and sess["step"] == "await_type":
                     sess["type"] = TYPE_LABELS.get(pb.get("value", ""), "不明")
                     sess["step"] = "await_scale"
                     sess["updated_at"] = now
                     await reply_to_line(reply_token, ASK_SCALE, choice_items("intake_scale", SCALE_LABELS))
-
                 elif action == "intake_scale" and sess["step"] == "await_scale":
                     sess["scale"] = SCALE_LABELS.get(pb.get("value", ""), "不明")
                     sess["step"] = "await_timing"
                     sess["updated_at"] = now
                     await reply_to_line(reply_token, ASK_TIMING, choice_items("intake_timing", TIMING_LABELS))
-
                 elif action == "intake_timing" and sess["step"] == "await_timing":
                     sess["timing"] = TIMING_LABELS.get(pb.get("value", ""), "不明")
-                    # 完了 → 事務員へPush
                     notice = build_staff_notice(sess, now)
                     logger.info(json.dumps({
                         "type": "intake", "timestamp": now.isoformat(), "user_id": user_id,
@@ -485,7 +460,6 @@ async def webhook(request: Request):
                     await reply_to_line(reply_token, build_user_complete(sess, now))
                     sessions.pop(user_id, None)
                 else:
-                    # 状態とアクションがずれている（二重タップ等）
                     await reply_to_line(reply_token, DURING_INTAKE)
 
     return PlainTextResponse("OK")
