@@ -23,9 +23,13 @@ LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-# 日次レポート・bad即時通知のPush送信先（カンマ区切りで複数可）
+# 日次レポート・bad即時通知の宛先（カンマ区切りで複数可）
 ADMIN_USER_IDS = [
     uid.strip() for uid in os.environ.get("ADMIN_USER_IDS", "").split(",") if uid.strip()
+]
+# 片付け受付通知の宛先（事務員。カンマ区切りで複数可）
+STAFF_USER_IDS = [
+    uid.strip() for uid in os.environ.get("STAFF_USER_IDS", "").split(",") if uid.strip()
 ]
 # /daily-report の簡易保護キー（未設定なら保護なし）
 REPORT_KEY = os.environ.get("REPORT_KEY", "")
@@ -35,7 +39,6 @@ BASE_DIR = Path(__file__).parent
 KNOWLEDGE = (BASE_DIR / "itoda_gomi_knowledge_v2.md").read_text(encoding="utf-8")
 SYSTEM_PROMPT_BASE = (BASE_DIR / "system_prompt_v3.txt").read_text(encoding="utf-8")
 
-# システムプロンプトにナレッジを埋め込み
 SYSTEM_PROMPT = f"""{SYSTEM_PROMPT_BASE}
 
 # 知識ベース（糸田町のごみ分別ルール）
@@ -49,35 +52,58 @@ anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
-# === インメモリ集計用ストア（当日分のみ保持。再起動でリセット） ===
+# === インメモリ集計用ストア（当日分のみ。再起動でリセット） ===
 qa_records: list[dict] = []
 feedback_records: list[dict] = []
 
+# === 受付フローのセッション（user_idごとの状態。再起動でリセット） ===
+# sessions[user_id] = {"step", "contact", "type", "scale", "updated_at"}
+sessions: dict[str, dict] = {}
+SESSION_TIMEOUT_SEC = 600  # 10分
+
+# 片付け受付の起点キーワード
+CLEANUP_KEYWORDS = [
+    "片付け", "片づけ", "かたづけ", "処分", "運び出し", "運べない", "運んで",
+    "ゴミ屋敷", "ごみ屋敷", "遺品整理", "生前整理", "引っ越し", "引越し",
+    "大量", "重い", "一人で", "高齢",
+]
+
+# 選択肢のコード→ラベル変換
+TYPE_LABELS = {"t1": "粗大ごみ（家具など）", "t2": "雑多なごみ", "t3": "その他"}
+SCALE_LABELS = {"s1": "家具数点", "s2": "1部屋分", "s3": "一軒丸ごと", "s4": "その他"}
+TIMING_LABELS = {"d1": "できるだけ早く", "d2": "1週間以内", "d3": "1ヶ月以内", "d4": "その他"}
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
 
 def today_str() -> str:
-    return datetime.now(JST).strftime("%Y-%m-%d")
+    return now_jst().strftime("%Y-%m-%d")
+
+
+def is_business_hours(dt: datetime) -> bool:
+    """平日 8:00〜17:00 を営業時間とする"""
+    if dt.weekday() >= 5:  # 土日
+        return False
+    return 8 <= dt.hour < 17
 
 
 def prune_old_records() -> None:
-    """当日(JST)以外のレコードを破棄してメモリ肥大を防ぐ"""
     today = today_str()
     qa_records[:] = [r for r in qa_records if r["date"] == today]
     feedback_records[:] = [r for r in feedback_records if r["date"] == today]
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
-    """LINEからのリクエスト署名検証"""
     hash_value = hmac.new(
-        LINE_CHANNEL_SECRET.encode("utf-8"),
-        body,
-        hashlib.sha256,
+        LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256
     ).digest()
     expected = base64.b64encode(hash_value).decode("utf-8")
     return hmac.compare_digest(expected, signature)
 
 
 def get_claude_response(user_message: str) -> str:
-    """Claude Haiku 4.5に質問を投げて回答を得る"""
     try:
         message = anthropic_client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -95,42 +121,40 @@ def get_claude_response(user_message: str) -> str:
         )
 
 
-async def reply_to_line(reply_token: str, text: str, answer_id: str | None = None) -> None:
-    """LINE Messaging APIに返信。answer_idがあるとき👍/👎のQuick Replyを付与"""
+# === Quick Reply アイテム生成 ===
+def feedback_items(answer_id: str) -> list[dict]:
+    return [
+        {"type": "action", "action": {"type": "postback", "label": "👍 役立った",
+            "data": f"action=feedback&rating=good&answer_id={answer_id}", "displayText": "👍 役立った"}},
+        {"type": "action", "action": {"type": "postback", "label": "👎 役立たなかった",
+            "data": f"action=feedback&rating=bad&answer_id={answer_id}", "displayText": "👎 役立たなかった"}},
+    ]
+
+
+def intake_start_items() -> list[dict]:
+    return [
+        {"type": "action", "action": {"type": "postback", "label": "依頼を受け付ける",
+            "data": "action=intake_start", "displayText": "依頼を受け付ける"}},
+    ]
+
+
+def choice_items(action: str, labels: dict) -> list[dict]:
+    items = []
+    for code, label in labels.items():
+        items.append({"type": "action", "action": {"type": "postback",
+            "label": label, "data": f"action={action}&value={code}", "displayText": label}})
+    return items
+
+
+async def reply_to_line(reply_token: str, text: str, quick_items: list[dict] | None = None) -> None:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
     }
     message = {"type": "text", "text": text}
-
-    if answer_id:
-        message["quickReply"] = {
-            "items": [
-                {
-                    "type": "action",
-                    "action": {
-                        "type": "postback",
-                        "label": "👍 役立った",
-                        "data": f"action=feedback&rating=good&answer_id={answer_id}",
-                        "displayText": "👍 役立った",
-                    },
-                },
-                {
-                    "type": "action",
-                    "action": {
-                        "type": "postback",
-                        "label": "👎 役立たなかった",
-                        "data": f"action=feedback&rating=bad&answer_id={answer_id}",
-                        "displayText": "👎 役立たなかった",
-                    },
-                },
-            ]
-        }
-
-    payload = {
-        "replyToken": reply_token,
-        "messages": [message],
-    }
+    if quick_items:
+        message["quickReply"] = {"items": quick_items}
+    payload = {"replyToken": reply_token, "messages": [message]}
     async with httpx.AsyncClient(timeout=10.0) as http_client:
         resp = await http_client.post(LINE_REPLY_URL, headers=headers, json=payload)
         if resp.status_code != 200:
@@ -138,7 +162,6 @@ async def reply_to_line(reply_token: str, text: str, answer_id: str | None = Non
 
 
 async def push_to_line(user_ids: list[str], text: str) -> None:
-    """指定ユーザーへPush送信"""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
@@ -152,7 +175,6 @@ async def push_to_line(user_ids: list[str], text: str) -> None:
 
 
 def parse_postback(data: str) -> dict:
-    """'action=feedback&rating=good&answer_id=xxx' 形式を辞書に変換"""
     result = {}
     for pair in data.split("&"):
         if "=" in pair:
@@ -161,8 +183,88 @@ def parse_postback(data: str) -> dict:
     return result
 
 
+def contains_cleanup_keyword(text: str) -> bool:
+    return any(kw in text for kw in CLEANUP_KEYWORDS)
+
+
+def session_expired(sess: dict, now: datetime) -> bool:
+    return (now - sess["updated_at"]).total_seconds() > SESSION_TIMEOUT_SEC
+
+
+# === 固定メッセージ ===
+CLEANUP_GUIDE = (
+    "ごみの運び出しやお片付けは、糸田清掃で承っております。\n"
+    "家具の処分、お部屋の片付け、一軒まるごとの整理まで対応しています。\n\n"
+    "このままLINEで依頼の受付ができます。\n"
+    "下のボタンからお進みください。"
+)
+ASK_CONTACT = (
+    "ご依頼を受け付けます。\n"
+    "まず、ご連絡先を教えてください。\n\n"
+    "・お名前\n・お電話番号\n・ご住所\n\n"
+    "を1つのメッセージでお送りください。\n"
+    "（中止する場合は「キャンセル」とお送りください）"
+)
+ASK_TYPE = "ありがとうございます。\nごみの内容をお選びください。"
+ASK_SCALE = "規模をお選びください。"
+ASK_TIMING = "ご希望の時期をお選びください。"
+DURING_INTAKE = (
+    "ただいま受付中です。\n"
+    "下の選択肢のボタンからお選びください。\n"
+    "中止する場合は「キャンセル」とお送りください。"
+)
+CANCEL_MSG = "受付をキャンセルしました。またのご利用をお待ちしております。"
+TIMEOUT_MSG = (
+    "一定時間ご返信がなかったため、受付を中断しました。\n"
+    "再度ご希望の際は、お申し付けください。"
+)
+EXPIRED_MSG = "受付の有効期限が切れました。お手数ですが、もう一度お申し付けください。"
+
+
+def build_staff_notice(sess: dict, when: datetime) -> str:
+    ts = when.strftime("%Y-%m-%d %H:%M")
+    lines = [
+        "【新規片付け依頼】",
+        "",
+        "■ ご連絡先",
+        sess["contact"],
+        "",
+        "■ ご依頼内容",
+        f"ごみの内容: {sess['type']}",
+        f"規模: {sess['scale']}",
+        f"希望時期: {sess['timing']}",
+        "",
+        "■ 受付日時",
+        ts,
+    ]
+    if not is_business_hours(when):
+        lines.append("")
+        lines.append("※ 営業時間外の受付です")
+    return "\n".join(lines)
+
+
+def build_user_complete(sess: dict, when: datetime) -> str:
+    lines = [
+        "ご依頼を受け付けました。",
+        "担当者より折り返しご連絡いたします。",
+        "",
+        "━━━━━━━━━━━━━",
+        "【ご入力内容】",
+        f"ご連絡先: {sess['contact']}",
+        f"ごみの内容: {sess['type']}",
+        f"規模: {sess['scale']}",
+        f"希望時期: {sess['timing']}",
+        "━━━━━━━━━━━━━",
+    ]
+    if not is_business_hours(when):
+        lines.append("")
+        lines.append("※ ただいま営業時間外のため、ご連絡は翌営業日になる場合があります。")
+    lines.append("")
+    lines.append("糸田清掃 0947-26-0917（平日 8:00〜17:00）")
+    return "\n".join(lines)
+
+
 def build_bad_alert(answer_id: str, when: datetime) -> str:
-    """bad評価された質問・回答をインメモリから引いて即時通知文を生成"""
     qa = next((r for r in qa_records if r["answer_id"] == answer_id), None)
     ts = when.strftime("%Y-%m-%d %H:%M")
     if qa:
@@ -173,17 +275,15 @@ def build_bad_alert(answer_id: str, when: datetime) -> str:
             "━━━━━━━━━━━━━\n"
             f"A:\n{qa['answer']}"
         )
-    # 再起動等でqa_recordsに無い場合は最低限の情報のみ
     return (
         f"【👎 bad評価がつきました】{ts}\n"
         "━━━━━━━━━━━━━\n"
-        f"※ 質問本文を取得できませんでした（再起動直後の可能性）\n"
+        "※ 質問本文を取得できませんでした（再起動直後の可能性）\n"
         f"answer_id: {answer_id}"
     )
 
 
 def build_daily_report() -> str:
-    """当日分のインメモリ集計から日次レポート本文を生成"""
     prune_old_records()
     today = today_str()
 
@@ -202,9 +302,7 @@ def build_daily_report() -> str:
 
     bad_answer_ids = {f["answer_id"] for f in feedback_records if f["rating"] == "bad"}
     qa_by_id = {r["answer_id"]: r for r in qa_records}
-    bad_questions = [
-        qa_by_id[aid]["question"] for aid in bad_answer_ids if aid in qa_by_id
-    ]
+    bad_questions = [qa_by_id[aid]["question"] for aid in bad_answer_ids if aid in qa_by_id]
 
     rated_answer_ids = {f["answer_id"] for f in feedback_records}
     no_rating = sum(1 for r in qa_records if r["answer_id"] not in rated_answer_ids)
@@ -223,16 +321,13 @@ def build_daily_report() -> str:
         f"・評価率: {rate_pct}% ({rated}/{total_q})",
         f"・bad率: {bad_pct}%",
     ]
-
     if bad_questions:
         lines.append("")
         lines.append("■ bad評価された質問")
         for i, q in enumerate(bad_questions, 1):
             lines.append(f"{i}. {q}")
-
     lines.append("")
     lines.append(f"■ 評価なしで終わった質問数: {no_rating}件")
-
     return "\n".join(lines)
 
 
@@ -248,14 +343,10 @@ async def health():
 
 @app.get("/daily-report")
 async def daily_report(key: str = ""):
-    """当日分を集計して管理者へPush。REPORT_KEY設定時はkey一致が必要"""
     if REPORT_KEY and key != REPORT_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
     if not ADMIN_USER_IDS:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "ADMIN_USER_IDS が未設定です"},
-        )
+        return JSONResponse(status_code=400, content={"error": "ADMIN_USER_IDS が未設定です"})
     report = build_daily_report()
     await push_to_line(ADMIN_USER_IDS, report)
     return {"status": "sent", "recipients": len(ADMIN_USER_IDS)}
@@ -265,7 +356,6 @@ async def daily_report(key: str = ""):
 async def webhook(request: Request):
     body = await request.body()
     signature = request.headers.get("x-line-signature", "")
-
     if not verify_signature(body, signature):
         logger.warning("Invalid signature")
         raise HTTPException(status_code=400, detail="Invalid signature")
@@ -277,65 +367,125 @@ async def webhook(request: Request):
         event_type = event.get("type")
         reply_token = event.get("replyToken", "")
         user_id = event.get("source", {}).get("userId", "unknown")
+        now = now_jst()
 
+        # ============ テキストメッセージ ============
         if event_type == "message":
             message = event.get("message", {})
             if message.get("type") != "text":
                 continue
-
             user_text = message.get("text", "")
+
+            sess = sessions.get(user_id)
+
+            # 受付セッションのタイムアウト判定
+            if sess and session_expired(sess, now):
+                sessions.pop(user_id, None)
+                await reply_to_line(reply_token, TIMEOUT_MSG)
+                continue
+
+            # 受付フロー中の処理
+            if sess:
+                if user_text.strip() in ("キャンセル", "中止", "やめる"):
+                    sessions.pop(user_id, None)
+                    await reply_to_line(reply_token, CANCEL_MSG)
+                    continue
+                if sess["step"] == "await_contact":
+                    sess["contact"] = user_text.strip()
+                    sess["step"] = "await_type"
+                    sess["updated_at"] = now
+                    await reply_to_line(reply_token, ASK_TYPE, choice_items("intake_type", TYPE_LABELS))
+                    continue
+                # 選択待ちの段階でテキストが来た場合は促す
+                await reply_to_line(reply_token, DURING_INTAKE)
+                continue
+
+            # IDLE: 片付けキーワード検知 → 固定案内＋受付ボタン
+            if contains_cleanup_keyword(user_text):
+                await reply_to_line(reply_token, CLEANUP_GUIDE, intake_start_items())
+                continue
+
+            # 通常のごみ分別応答（good/bad付き）
             answer = get_claude_response(user_text)
             answer_id = str(uuid.uuid4())
-            now = datetime.now(JST)
-
             logger.info(json.dumps({
-                "type": "qa_log",
-                "timestamp": now.isoformat(),
-                "answer_id": answer_id,
-                "user_id": user_id,
-                "question": user_text,
-                "answer": answer,
+                "type": "qa_log", "timestamp": now.isoformat(), "answer_id": answer_id,
+                "user_id": user_id, "question": user_text, "answer": answer,
             }, ensure_ascii=False))
-
             prune_old_records()
             qa_records.append({
-                "date": now.strftime("%Y-%m-%d"),
-                "answer_id": answer_id,
-                "user_id": user_id,
-                "question": user_text,
-                "answer": answer,
+                "date": now.strftime("%Y-%m-%d"), "answer_id": answer_id,
+                "user_id": user_id, "question": user_text, "answer": answer,
             })
+            await reply_to_line(reply_token, answer, feedback_items(answer_id))
 
-            await reply_to_line(reply_token, answer, answer_id=answer_id)
-
+        # ============ postback ============
         elif event_type == "postback":
             pb = parse_postback(event.get("postback", {}).get("data", ""))
-            if pb.get("action") == "feedback":
-                now = datetime.now(JST)
+            action = pb.get("action", "")
+
+            # --- good/bad 評価 ---
+            if action == "feedback":
                 rating = pb.get("rating", "")
                 ans_id = pb.get("answer_id", "")
-
                 logger.info(json.dumps({
-                    "type": "feedback",
-                    "timestamp": now.isoformat(),
-                    "answer_id": ans_id,
-                    "user_id": user_id,
-                    "rating": rating,
+                    "type": "feedback", "timestamp": now.isoformat(), "answer_id": ans_id,
+                    "user_id": user_id, "rating": rating,
                 }, ensure_ascii=False))
-
                 prune_old_records()
                 feedback_records.append({
-                    "date": now.strftime("%Y-%m-%d"),
-                    "answer_id": ans_id,
-                    "user_id": user_id,
-                    "rating": rating,
+                    "date": now.strftime("%Y-%m-%d"), "answer_id": ans_id,
+                    "user_id": user_id, "rating": rating,
                 })
-
-                # bad評価は管理者へ即時Push（取りこぼし防止）
                 if rating == "bad" and ADMIN_USER_IDS:
-                    alert = build_bad_alert(ans_id, now)
-                    await push_to_line(ADMIN_USER_IDS, alert)
-
+                    await push_to_line(ADMIN_USER_IDS, build_bad_alert(ans_id, now))
                 await reply_to_line(reply_token, "ご評価ありがとうございます。")
+
+            # --- 受付開始 ---
+            elif action == "intake_start":
+                sessions[user_id] = {
+                    "step": "await_contact", "contact": None,
+                    "type": None, "scale": None, "timing": None, "updated_at": now,
+                }
+                await reply_to_line(reply_token, ASK_CONTACT)
+
+            # --- 受付の選択ステップ ---
+            elif action in ("intake_type", "intake_scale", "intake_timing"):
+                sess = sessions.get(user_id)
+                if not sess or session_expired(sess, now):
+                    sessions.pop(user_id, None)
+                    await reply_to_line(reply_token, EXPIRED_MSG)
+                    continue
+
+                if action == "intake_type" and sess["step"] == "await_type":
+                    sess["type"] = TYPE_LABELS.get(pb.get("value", ""), "不明")
+                    sess["step"] = "await_scale"
+                    sess["updated_at"] = now
+                    await reply_to_line(reply_token, ASK_SCALE, choice_items("intake_scale", SCALE_LABELS))
+
+                elif action == "intake_scale" and sess["step"] == "await_scale":
+                    sess["scale"] = SCALE_LABELS.get(pb.get("value", ""), "不明")
+                    sess["step"] = "await_timing"
+                    sess["updated_at"] = now
+                    await reply_to_line(reply_token, ASK_TIMING, choice_items("intake_timing", TIMING_LABELS))
+
+                elif action == "intake_timing" and sess["step"] == "await_timing":
+                    sess["timing"] = TIMING_LABELS.get(pb.get("value", ""), "不明")
+                    # 完了 → 事務員へPush
+                    notice = build_staff_notice(sess, now)
+                    logger.info(json.dumps({
+                        "type": "intake", "timestamp": now.isoformat(), "user_id": user_id,
+                        "contact": sess["contact"], "gomi_type": sess["type"],
+                        "scale": sess["scale"], "timing": sess["timing"],
+                    }, ensure_ascii=False))
+                    if STAFF_USER_IDS:
+                        await push_to_line(STAFF_USER_IDS, notice)
+                    else:
+                        logger.error("STAFF_USER_IDS 未設定のため受付通知を送信できません")
+                    await reply_to_line(reply_token, build_user_complete(sess, now))
+                    sessions.pop(user_id, None)
+                else:
+                    # 状態とアクションがずれている（二重タップ等）
+                    await reply_to_line(reply_token, DURING_INTAKE)
 
     return PlainTextResponse("OK")
