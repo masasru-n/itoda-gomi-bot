@@ -23,7 +23,7 @@ LINE_CHANNEL_SECRET = os.environ["LINE_CHANNEL_SECRET"]
 LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-# 日次レポートのPush送信先（カンマ区切りで複数可）
+# 日次レポート・bad即時通知のPush送信先（カンマ区切りで複数可）
 ADMIN_USER_IDS = [
     uid.strip() for uid in os.environ.get("ADMIN_USER_IDS", "").split(",") if uid.strip()
 ]
@@ -159,6 +159,27 @@ def parse_postback(data: str) -> dict:
             key, value = pair.split("=", 1)
             result[key] = value
     return result
+
+
+def build_bad_alert(answer_id: str, when: datetime) -> str:
+    """bad評価された質問・回答をインメモリから引いて即時通知文を生成"""
+    qa = next((r for r in qa_records if r["answer_id"] == answer_id), None)
+    ts = when.strftime("%Y-%m-%d %H:%M")
+    if qa:
+        return (
+            f"【👎 bad評価がつきました】{ts}\n"
+            "━━━━━━━━━━━━━\n"
+            f"Q: {qa['question']}\n"
+            "━━━━━━━━━━━━━\n"
+            f"A:\n{qa['answer']}"
+        )
+    # 再起動等でqa_recordsに無い場合は最低限の情報のみ
+    return (
+        f"【👎 bad評価がつきました】{ts}\n"
+        "━━━━━━━━━━━━━\n"
+        f"※ 質問本文を取得できませんでした（再起動直後の可能性）\n"
+        f"answer_id: {answer_id}"
+    )
 
 
 def build_daily_report() -> str:
@@ -309,6 +330,11 @@ async def webhook(request: Request):
                     "user_id": user_id,
                     "rating": rating,
                 })
+
+                # bad評価は管理者へ即時Push（取りこぼし防止）
+                if rating == "bad" and ADMIN_USER_IDS:
+                    alert = build_bad_alert(ans_id, now)
+                    await push_to_line(ADMIN_USER_IDS, alert)
 
                 await reply_to_line(reply_token, "ご評価ありがとうございます。")
 
