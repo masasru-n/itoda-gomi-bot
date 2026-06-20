@@ -30,6 +30,9 @@ STAFF_USER_IDS = [
 ]
 REPORT_KEY = os.environ.get("REPORT_KEY", "")
 
+DAILY_LIMIT_PER_USER = int(os.environ.get("DAILY_LIMIT_PER_USER", "20"))
+DAILY_LIMIT_TOTAL = int(os.environ.get("DAILY_LIMIT_TOTAL", "100"))
+
 BASE_DIR = Path(__file__).parent
 KNOWLEDGE = (BASE_DIR / "itoda_gomi_knowledge_v2.md").read_text(encoding="utf-8")
 SYSTEM_PROMPT_BASE = (BASE_DIR / "system_prompt_v3.txt").read_text(encoding="utf-8")
@@ -179,6 +182,33 @@ def contains_cleanup_keyword(text: str) -> bool:
 
 def session_expired(sess: dict, now: datetime) -> bool:
     return (now - sess["updated_at"]).total_seconds() > SESSION_TIMEOUT_SEC
+
+
+# ───────────────────────────────────────────────
+# レート制限（日次キャップ）
+# qa_records は prune_old_records() で「今日ぶんだけ」に保たれるため、
+# 日付が変われば自動でリセットされる。値は環境変数で可変。
+# ※ インメモリのため、Railway 再起動でもカウントはリセットされる。
+# ───────────────────────────────────────────────
+rate_alert_sent: dict[str, str] = {}  # {"user"/"total": "YYYY-MM-DD"} … その日アラート済みか
+
+
+def count_today_user(user_id: str) -> int:
+    return sum(1 for r in qa_records if r["user_id"] == user_id)
+
+
+def count_today_total() -> int:
+    return len(qa_records)
+
+
+async def notify_limit_once(kind: str, detail: str, when: datetime) -> None:
+    """同じ種別の上限通知は1日1回だけ admin に送る"""
+    today = when.strftime("%Y-%m-%d")
+    if rate_alert_sent.get(kind) == today:
+        return
+    rate_alert_sent[kind] = today
+    if ADMIN_USER_IDS:
+        await push_to_line(ADMIN_USER_IDS, f"【レート上限到達】{when.strftime('%H:%M')}\n{detail}")
 
 
 # ───────────────────────────────────────────────
@@ -402,6 +432,25 @@ async def webhook(request: Request):
 
             if contains_cleanup_keyword(user_text):
                 await reply_to_line(reply_token, CLEANUP_GUIDE, cleanup_entry_items())
+                continue
+
+            # ── レート制限（Claude呼び出しの手前で判定。ポストバック類は対象外）──
+            prune_old_records()
+            if count_today_total() >= DAILY_LIMIT_TOTAL:
+                await notify_limit_once("total", f"全体が本日上限 {DAILY_LIMIT_TOTAL} 回に到達しました。", now)
+                await reply_to_line(reply_token, "ただいま混み合っております。お手数ですが、時間をおいてお試しください。")
+                continue
+            if count_today_user(user_id) >= DAILY_LIMIT_PER_USER:
+                await notify_limit_once(
+                    "user",
+                    f"あるユーザーが本日の個人上限 {DAILY_LIMIT_PER_USER} 回に到達しました。（user_id 末尾: {user_id[-6:]}）",
+                    now,
+                )
+                await reply_to_line(
+                    reply_token,
+                    "本日のご利用が一定数に達しました。お手数ですが、明日以降にお試しください。\n"
+                    "お急ぎの場合は 📞 0947-26-0917（平日 8:00〜17:00）",
+                )
                 continue
 
             answer = get_claude_response(user_text)
