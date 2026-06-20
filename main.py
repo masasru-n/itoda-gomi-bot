@@ -47,27 +47,6 @@ anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
-# ── リッチメニュー登録用（/setup-richmenu で使用）──
-LP_URL = "https://itodaseisou.jp/lp"
-RICHMENU_IMAGE = BASE_DIR / "richmenu3.png"
-RICHMENU_DEF = {
-    "size": {"width": 2500, "height": 843},
-    "selected": True,
-    "name": "sil_main_v1",
-    "chatBarText": "メニュー",
-    "areas": [
-        # 左：使い方ガイド（テキストは飛ばさない）
-        {"bounds": {"x": 0, "y": 0, "width": 833, "height": 843},
-         "action": {"type": "postback", "data": "action=usage_guide"}},
-        # 中央：片付けサービス案内（テキストは飛ばさない）
-        {"bounds": {"x": 833, "y": 0, "width": 834, "height": 843},
-         "action": {"type": "postback", "data": "action=cleanup_menu"}},
-        # 右：公式サイト（LP を開く）
-        {"bounds": {"x": 1667, "y": 0, "width": 833, "height": 843},
-         "action": {"type": "uri", "uri": LP_URL}},
-    ],
-}
-
 qa_records: list[dict] = []
 feedback_records: list[dict] = []
 
@@ -376,87 +355,6 @@ async def daily_report(key: str = ""):
     await push_to_line(ADMIN_USER_IDS, report)
     return {"status": "sent", "recipients": len(ADMIN_USER_IDS)}
 
-
-@app.get("/setup-richmenu")
-async def setup_richmenu(key: str = ""):
-    """リッチメニューをAPI登録する一時エンドポイント（登録後はデプロイで消す想定）。
-    ブラウザで /setup-richmenu?key=（REPORT_KEY）を1回開くだけで登録される。"""
-    if REPORT_KEY and key != REPORT_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    if not RICHMENU_IMAGE.exists():
-        return JSONResponse(status_code=500, content={"error": f"画像が見つかりません: {RICHMENU_IMAGE}"})
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient(timeout=30.0) as c:
-        # 1) 定義を登録
-        r = await c.post(
-            "https://api.line.me/v2/bot/richmenu",
-            headers={**headers, "Content-Type": "application/json"},
-            json=RICHMENU_DEF,
-        )
-        if r.status_code != 200:
-            return JSONResponse(status_code=500, content={"step": "create", "status": r.status_code, "body": r.text})
-        rid = r.json()["richMenuId"]
-        # 2) 画像をアップロード
-        r = await c.post(
-            f"https://api-data.line.me/v2/bot/richmenu/{rid}/content",
-            headers={**headers, "Content-Type": "image/png"},
-            content=RICHMENU_IMAGE.read_bytes(),
-        )
-        if r.status_code != 200:
-            return JSONResponse(status_code=500, content={"step": "image", "status": r.status_code, "body": r.text})
-        # 3) 全ユーザーのデフォルトに設定
-        r = await c.post(
-            f"https://api.line.me/v2/bot/user/all/richmenu/{rid}",
-            headers=headers,
-        )
-        if r.status_code != 200:
-            return JSONResponse(status_code=500, content={"step": "default", "status": r.status_code, "body": r.text})
-    return {"status": "done", "richMenuId": rid}
-
-
-@app.get("/reset-richmenu")
-async def reset_richmenu(key: str = ""):
-    """既存のリッチメニューを全削除してから、指定画像で再登録する一時エンドポイント。
-    ブラウザで /reset-richmenu?key=（REPORT_KEY）を1回開くだけ。登録後はデプロイで消す想定。"""
-    if REPORT_KEY and key != REPORT_KEY:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    if not RICHMENU_IMAGE.exists():
-        return JSONResponse(status_code=500, content={"error": f"画像が見つかりません: {RICHMENU_IMAGE}"})
-    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient(timeout=30.0) as c:
-        # 0) 既存のリッチメニューを全削除
-        listed = await c.get("https://api.line.me/v2/bot/richmenu/list", headers=headers)
-        deleted = []
-        if listed.status_code == 200:
-            for m in listed.json().get("richmenus", []):
-                rid_old = m["richMenuId"]
-                await c.delete(f"https://api.line.me/v2/bot/richmenu/{rid_old}", headers=headers)
-                deleted.append(rid_old)
-        # 1) 新規登録
-        r = await c.post(
-            "https://api.line.me/v2/bot/richmenu",
-            headers={**headers, "Content-Type": "application/json"},
-            json=RICHMENU_DEF,
-        )
-        if r.status_code != 200:
-            return JSONResponse(status_code=500, content={"step": "create", "status": r.status_code, "body": r.text})
-        rid = r.json()["richMenuId"]
-        # 2) 画像をアップロード
-        r = await c.post(
-            f"https://api-data.line.me/v2/bot/richmenu/{rid}/content",
-            headers={**headers, "Content-Type": "image/png"},
-            content=RICHMENU_IMAGE.read_bytes(),
-        )
-        if r.status_code != 200:
-            return JSONResponse(status_code=500, content={"step": "image", "status": r.status_code, "body": r.text})
-        # 3) 全ユーザーのデフォルトに設定
-        r = await c.post(
-            f"https://api.line.me/v2/bot/user/all/richmenu/{rid}",
-            headers=headers,
-        )
-        if r.status_code != 200:
-            return JSONResponse(status_code=500, content={"step": "default", "status": r.status_code, "body": r.text})
-    return {"status": "done", "deleted": deleted, "new": rid}
 
 
 @app.post("/webhook")
