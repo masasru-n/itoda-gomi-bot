@@ -50,6 +50,24 @@ anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
+# ── リッチメニュー登録用（一時・登録後に削除する）──
+LP_URL = "https://itodaseisou.jp/lp"
+RICHMENU_IMAGE = BASE_DIR / "richmenu3.png"
+RICHMENU_DEF = {
+    "size": {"width": 2500, "height": 843},
+    "selected": True,
+    "name": "sil_main_v1",
+    "chatBarText": "メニュー",
+    "areas": [
+        {"bounds": {"x": 0, "y": 0, "width": 833, "height": 843},
+         "action": {"type": "postback", "data": "action=usage_guide"}},
+        {"bounds": {"x": 833, "y": 0, "width": 834, "height": 843},
+         "action": {"type": "postback", "data": "action=cleanup_menu"}},
+        {"bounds": {"x": 1667, "y": 0, "width": 833, "height": 843},
+         "action": {"type": "uri", "uri": LP_URL}},
+    ],
+}
+
 qa_records: list[dict] = []
 feedback_records: list[dict] = []
 
@@ -385,6 +403,45 @@ async def daily_report(key: str = ""):
     await push_to_line(ADMIN_USER_IDS, report)
     return {"status": "sent", "recipients": len(ADMIN_USER_IDS)}
 
+
+
+@app.get("/reset-richmenu")
+async def reset_richmenu(key: str = ""):
+    if REPORT_KEY and key != REPORT_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not RICHMENU_IMAGE.exists():
+        return JSONResponse(status_code=500, content={"error": f"画像が見つかりません: {RICHMENU_IMAGE}"})
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        listed = await c.get("https://api.line.me/v2/bot/richmenu/list", headers=headers)
+        deleted = []
+        if listed.status_code == 200:
+            for m in listed.json().get("richmenus", []):
+                rid_old = m["richMenuId"]
+                await c.delete(f"https://api.line.me/v2/bot/richmenu/{rid_old}", headers=headers)
+                deleted.append(rid_old)
+        r = await c.post(
+            "https://api.line.me/v2/bot/richmenu",
+            headers={**headers, "Content-Type": "application/json"},
+            json=RICHMENU_DEF,
+        )
+        if r.status_code != 200:
+            return JSONResponse(status_code=500, content={"step": "create", "status": r.status_code, "body": r.text})
+        rid = r.json()["richMenuId"]
+        r = await c.post(
+            f"https://api-data.line.me/v2/bot/richmenu/{rid}/content",
+            headers={**headers, "Content-Type": "image/png"},
+            content=RICHMENU_IMAGE.read_bytes(),
+        )
+        if r.status_code != 200:
+            return JSONResponse(status_code=500, content={"step": "image", "status": r.status_code, "body": r.text})
+        r = await c.post(
+            f"https://api.line.me/v2/bot/user/all/richmenu/{rid}",
+            headers=headers,
+        )
+        if r.status_code != 200:
+            return JSONResponse(status_code=500, content={"step": "default", "status": r.status_code, "body": r.text})
+    return {"status": "done", "deleted": deleted, "new": rid}
 
 
 @app.post("/webhook")
