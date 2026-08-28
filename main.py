@@ -525,9 +525,9 @@ async def webhook(request: Request):
                     sess["timing"] = TIMING_LABELS.get(pb.get("value", ""), "不明")
                     notice = build_staff_notice(sess, now)
                     logger.info(json.dumps({
-                        "type": "intake", "timestamp": now.isoformat(), "user_id": user_id,
-                        "contact": sess["contact"], "gomi_type": sess["type"],
-                        "scale": sess["scale"], "timing": sess["timing"],
+                    "type": "intake", "timestamp": now.isoformat(), "user_id": user_id,
+                    "gomi_type": sess["type"],
+                    "scale": sess["scale"], "timing": sess["timing"],
                     }, ensure_ascii=False))
                     if STAFF_USER_IDS:
                         await push_to_line(STAFF_USER_IDS, notice)
