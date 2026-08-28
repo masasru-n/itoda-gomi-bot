@@ -108,8 +108,8 @@ def get_claude_response(user_message: str) -> str:
         logger.exception("Claude API error")
         return (
             "申し訳ありません、現在お答えできません。\n"
-            "しばらく時間をおいて再度お試しください。\n"
-            "📞 糸田清掃 0947-26-0917（平日 8:00〜17:00）"
+            "しばらく時間をおいて再度お試しください。\n\n"
+            f"{SIGNATURE}"
         )
 
 
@@ -220,6 +220,15 @@ async def notify_limit_once(kind: str, detail: str, when: datetime) -> None:
 # ───────────────────────────────────────────────
 # リッチメニュー左タップ（postback: action=usage_guide）で返す使い方ガイド
 # ───────────────────────────────────────────────
+
+SIGNATURE = (
+    "━━━━━━━━━━━━━\n"
+    "有限会社 糸田清掃\n"
+    "TEL：0947-26-0917\n"
+    "営業時間：平日 8:00〜17:00\n"
+    "━━━━━━━━━━━━━"
+)
+
 USAGE_GUIDE = (
     "こんにちは。sil（シル）です。\n"
     "私は糸田町のごみ分別についてのご質問にお答えするAIアシスタントです。\n\n"
@@ -238,8 +247,8 @@ GREETING = (
     "─────────────\n"
     "・ご質問にはAIが自動で回答します\n"
     "・内容によっては糸田清掃の担当者が直接ご案内する場合があります\n"
-    "・回答に誤りが含まれる場合があります。判断に迷われる際はお電話ください\n"
-    "📞 糸田清掃 0947-26-0917（平日 8:00〜17:00）"
+    "・回答に誤りが含まれる場合があります。判断に迷われる際はお電話ください\n\n"
+    f"{SIGNATURE}"
 )
 
 SERVICE_INFO = (
@@ -252,9 +261,7 @@ SERVICE_INFO = (
     "AIの回答は参考情報です。判断に迷われる場合やお急ぎの場合は、お電話でお問い合わせください。\n\n"
     "■ 個人情報について\n"
     "お名前・ご住所・お電話番号などをAIに送信することはありません。片付けのお申し込みでお預かりした情報は、業務の遂行以外には使用いたしません。\n\n"
-    "─────────────\n"
-    "📞 糸田清掃 0947-26-0917\n"
-    "（平日 8:00〜17:00）"
+    f"{SIGNATURE}"
 )
 
 CLEANUP_GUIDE = (
@@ -268,10 +275,9 @@ CLEANUP_GUIDE = (
     "・生前整理・遺品整理・引越しごみ\n"
     "・高齢等でごみ出しが困難な方の支援\n\n"
     "お見積りは無料です。\n"
-    "お電話でのご相談が可能です（平日 8:00〜17:00）\n"
-    "📞 0947-26-0917\n\n"
-    "LINEでも受け付けております。\n"
-    "下のボタンからお選びください。"
+    "LINEまたはお電話で受け付けております。\n"
+    "下のボタンからお選びください。\n\n"
+    f"{SIGNATURE}"
 )
 ASK_CONTACT = (
     "ご依頼を受け付けます。\n"
@@ -335,7 +341,7 @@ def build_user_complete(sess: dict, when: datetime) -> str:
         lines.append("")
         lines.append("※ ただいま営業時間外のため、ご連絡は翌営業日になる場合があります。")
     lines.append("")
-    lines.append("糸田清掃 0947-26-0917（平日 8:00〜17:00）")
+    lines.append(SIGNATURE)
     return "\n".join(lines)
 
 
@@ -476,7 +482,11 @@ async def webhook(request: Request):
             prune_old_records()
             if count_today_total() >= DAILY_LIMIT_TOTAL:
                 await notify_limit_once("total", f"全体が本日上限 {DAILY_LIMIT_TOTAL} 回に到達しました。", now)
-                await reply_to_line(reply_token, "ただいま混み合っております。お手数ですが、時間をおいてお試しください。")
+                await reply_to_line(
+                    reply_token,
+                    "ただいま混み合っております。お手数ですが、時間をおいてお試しください。\n\n"
+                    f"{SIGNATURE}",
+                )
                 continue
             if count_today_user(user_id) >= DAILY_LIMIT_PER_USER:
                 await notify_limit_once(
@@ -487,7 +497,8 @@ async def webhook(request: Request):
                 await reply_to_line(
                     reply_token,
                     "本日のご利用が一定数に達しました。お手数ですが、明日以降にお試しください。\n"
-                    "お急ぎの場合は 📞 0947-26-0917（平日 8:00〜17:00）",
+                    "お急ぎの場合はお電話ください。\n\n"
+                    f"{SIGNATURE}",
                 )
                 continue
 
