@@ -138,6 +138,12 @@ def choice_items(action: str, labels: dict) -> list[dict]:
             "label": label, "data": f"action={action}&value={code}", "displayText": label}})
     return items
 
+def about_items() -> list[dict]:
+    return [
+        {"type": "action", "action": {"type": "postback",
+            "label": "このサービスについて",
+            "data": "action=about", "displayText": "このサービスについて"}},
+    ]
 
 async def reply_to_line(reply_token: str, text: str, quick_items: list[dict] | None = None) -> None:
     headers = {
@@ -223,6 +229,32 @@ USAGE_GUIDE = (
     "・「粗大ごみはどうやって出す？」\n"
     "・「ペットボトルのキャップはどこに入れるの？」\n\n"
     "お気軽にご質問ください。"
+)
+
+GREETING = (
+    "友だち追加ありがとうございます。\n"
+    "sil（シル）です。糸田町のごみ分別・収集日についてのご質問にお答えします。\n\n"
+    "「ペットボトルのキャップは？」のように、お気軽にご質問ください。\n\n"
+    "─────────────\n"
+    "・ご質問にはAIが自動で回答します\n"
+    "・内容によっては糸田清掃の担当者が直接ご案内する場合があります\n"
+    "・回答に誤りが含まれる場合があります。判断に迷われる際はお電話ください\n"
+    "📞 糸田清掃 0947-26-0917（平日 8:00〜17:00）"
+)
+
+SERVICE_INFO = (
+    "【このサービスについて】\n\n"
+    "■ AIが自動で回答します\n"
+    "糸田町が公開しているごみ分別表・よくあるご質問をもとに、AIが自動でお答えしています。\n\n"
+    "■ 担当者が直接ご案内する場合があります\n"
+    "内容によっては、糸田清掃の担当者が直接ご返信することがあります。\n\n"
+    "■ 回答に誤りが含まれる場合があります\n"
+    "AIの回答は参考情報です。判断に迷われる場合やお急ぎの場合は、お電話でお問い合わせください。\n\n"
+    "■ 個人情報について\n"
+    "お名前・ご住所・お電話番号などをAIに送信することはありません。片付けのお申し込みでお預かりした情報は、業務の遂行以外には使用いたしません。\n\n"
+    "─────────────\n"
+    "📞 糸田清掃 0947-26-0917\n"
+    "（平日 8:00〜17:00）"
 )
 
 CLEANUP_GUIDE = (
@@ -406,6 +438,10 @@ async def webhook(request: Request):
         user_id = event.get("source", {}).get("userId", "unknown")
         now = now_jst()
 
+        if event_type == "follow":
+            await reply_to_line(reply_token, GREETING)
+            continue
+
         if event_type == "message":
             message = event.get("message", {})
             if message.get("type") != "text":
@@ -474,7 +510,12 @@ async def webhook(request: Request):
 
             # ── リッチメニュー：左タップ（使い方ガイド）──
             if action == "usage_guide":
-                await reply_to_line(reply_token, USAGE_GUIDE)
+                await reply_to_line(reply_token, USAGE_GUIDE, about_items())
+                continue
+
+            # ── 「このサービスについて」（クイックリプライから）──
+            if action == "about":
+                await reply_to_line(reply_token, SERVICE_INFO)
                 continue
 
             # ── リッチメニュー：中央タップ（片付けサービス案内）──
