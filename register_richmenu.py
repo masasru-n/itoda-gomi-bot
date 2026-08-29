@@ -30,7 +30,7 @@ H = {"Authorization": f"Bearer {TOKEN}"}
 
 richmenu = {
     "size": {"width": 2500, "height": 843},
-    "selected": True,
+    "selected": False,
     "name": "sil_main_v1",
     "chatBarText": "メニュー",
     "areas": [
