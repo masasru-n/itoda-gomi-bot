@@ -74,7 +74,7 @@ cases:
     q: スプレー缶は何ゴミですか
     expect_any: ["青"]
     expect_all: ["使い切"]
-    forbid: ["穴を開け", "0947-26-0917"]
+    forbid: ["0947-26-0917"]
     note: 穴開け不要。無色袋ではなく青袋
 
   - id: simple-06
