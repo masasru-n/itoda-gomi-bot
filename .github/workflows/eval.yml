@@ -27,7 +27,12 @@ jobs:
           python-version: "3.12"
 
       - name: 依存をインストール
-        run: pip install anthropic pyyaml
+        run: |
+          # 本番(Railway)と同じ依存でテストするため requirements.txt から入れる
+          pip install -r requirements.txt
+          pip install pyyaml
+          echo "--- インストールされた anthropic ---"
+          pip show anthropic | head -2
 
       - name: テスト実行
         env:
